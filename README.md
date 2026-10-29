@@ -1,2 +1,0 @@
-# backtest
-backtesting-strategy
