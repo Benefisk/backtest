@@ -1,4 +1,4 @@
-
+# Библиотека для загрузки котировок с мос.биржи
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 TICKER = "SBER"
 SMA_PERIOD = 50
 COMMISSION = 0.0005  # 0,05% при изменении позиции
+TRADING_DAYS_PER_YEAR = 252
 
 
 def load_prices():
@@ -81,13 +82,15 @@ def run_backtest(df):
     # Используем сигнал предыдущего дня,
     # чтобы не применять будущее к прошлому
     df["position"] = df["signal"].shift(1).fillna(0)
+    df["position_change"] = df["position"].diff().fillna(df["position"])
+    # Сделкой считаем вход в позицию; выход — закрытие этой сделки.
+    df["trade_count"] = (df["position_change"] > 0).astype(int)
 
     # Изменение цены за день
     df["market_return"] = df["close"].pct_change()
 
     # Условная доходность стратегии
-    df["trades"] = df["position"].diff().abs()
-    df["trades"] = df["trades"].fillna(df["position"].abs())
+    df["trades"] = df["position_change"].abs()
 
     df["strategy_return"] = (
         df["position"] * df["market_return"]
@@ -109,12 +112,23 @@ def show_results(df):
     drawdown = df["equity"] / running_peak - 1
     max_drawdown = drawdown.min() * 100
 
+    daily_returns = df["strategy_return"].dropna()
+    volatility = daily_returns.std(ddof=1)
+    sharpe = (
+        daily_returns.mean() / volatility * (TRADING_DAYS_PER_YEAR ** 0.5)
+        if len(daily_returns) > 1 and volatility > 0
+        else 0.0
+    )
+    trade_count = int(df["trade_count"].sum())
+
     print(f"Инструмент: {TICKER}")
     print(f"Количество дневных свечей: {len(df)}")
     print(f"Начало периода: {df.index[0].date()}")
     print(f"Конец периода: {df.index[-1].date()}")
     print(f"Итоговая доходность: {total_return:.2f}%")
+    print(f"Sharpe (годовой, без безрисковой ставки): {sharpe:.2f}")
     print(f"Максимальная просадка: {max_drawdown:.2f}%")
+    print(f"Количество сделок (входов в позицию): {trade_count}")
 
     plt.figure(figsize=(12, 6))
     plt.plot(df.index, df["equity"], label="Стратегия")
