@@ -1,9 +1,11 @@
-# Библиотека для загрузки котировок с мос.биржи
+# requests загружает котировки по HTTP, pandas обрабатывает таблицы,
+# matplotlib строит график капитала.
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Настройки учебного эксперимента
+# Параметры эксперимента: тикер, длина SMA, комиссия за изменение позиции
+# и число торговых дней в году для годового коэффициента Sharpe.
 TICKER = "SBER"
 SMA_PERIOD = 50
 COMMISSION = 0.0005  # 0,05% при изменении позиции
@@ -11,13 +13,14 @@ TRADING_DAYS_PER_YEAR = 252
 
 
 def load_prices():
-    """Загружаем дневные цены с Московской биржи."""
+    """Загружает дневные свечи MOEX и очищает данные перед расчётами."""
 
     url = (
         "https://iss.moex.com/iss/engines/stock/"
         f"markets/shares/securities/{TICKER}/candles.json"
     )
 
+    # Биржа отдаёт данные страницами; start указывает смещение следующей страницы.
     all_rows = []
     start = 0
 
@@ -31,6 +34,7 @@ def load_prices():
             },
             timeout=30,
         )
+        # Прерываем работу с понятной HTTP-ошибкой, если запрос не удался.
         response.raise_for_status()
 
         candles = response.json()["candles"]
@@ -39,12 +43,14 @@ def load_prices():
             for row in candles["data"]
         ]
 
+        # Пустая страница означает, что котировки закончились.
         if not rows:
             break
 
         all_rows.extend(rows)
         start += len(rows)
 
+        # Если страница неполная, следующей страницы уже нет.
         if len(rows) < 500:
             break
 
@@ -53,10 +59,12 @@ def load_prices():
     if df.empty:
         raise ValueError("Биржа не вернула данные.")
 
+    # Приводим дату к типу datetime и используем её как индекс таблицы.
     df["begin"] = pd.to_datetime(df["begin"])
     df = df.set_index("begin")
     df = df[["open", "close", "volume"]].copy()
 
+    # Убираем дни без торгов, пропуски и дубли; сортируем хронологически.
     df = df[df["volume"] > 0]
     df = df.dropna()
     df = df[~df.index.duplicated(keep="last")]
@@ -73,23 +81,24 @@ def run_backtest(df):
 
     df = df.copy()
 
-    # Средняя цена закрытия за 50 торговых дней
+    # SMA — простая скользящая средняя цены закрытия за выбранное число дней.
     df["sma"] = df["close"].rolling(SMA_PERIOD).mean()
 
-    # Сигнал: 1 — цена выше средней, 0 — иначе
+    # Держим актив, когда закрытие выше SMA; иначе находимся в деньгах.
     df["signal"] = (df["close"] > df["sma"]).astype(int)
 
     # Используем сигнал предыдущего дня,
     # чтобы не применять будущее к прошлому
     df["position"] = df["signal"].shift(1).fillna(0)
+    # Разница позиции между днями показывает вход (0→1) или выход (1→0).
     df["position_change"] = df["position"].diff().fillna(df["position"])
-    # Сделкой считаем вход в позицию; выход — закрытие этой сделки.
+    # Считаем каждое открытие одной сделкой; последующий выход её закрывает.
     df["trade_count"] = (df["position_change"] > 0).astype(int)
 
-    # Изменение цены за день
+    # Дневная доходность инструмента относительно предыдущего закрытия.
     df["market_return"] = df["close"].pct_change()
 
-    # Условная доходность стратегии
+    # Доходность позиции за день минус комиссия за вход/выход.
     df["trades"] = df["position_change"].abs()
 
     df["strategy_return"] = (
@@ -97,21 +106,25 @@ def run_backtest(df):
         - df["trades"] * COMMISSION
     )
 
-    # Рост условного капитала
+    # Последовательно перемножаем дневные доходности, начиная с капитала 1.
     df["equity"] = (1 + df["strategy_return"].fillna(0)).cumprod()
 
     return df
 
 
 def show_results(df):
-    """Печатаем статистику и строим график."""
+    """Показываем метрики в отдельной панели рядом с графиком."""
 
+    # Итоговый прирост капитала в процентах от начального значения 1.
     total_return = (df["equity"].iloc[-1] - 1) * 100
 
+    # Просадка — падение от предыдущего максимума капитала; берём худшее.
     running_peak = df["equity"].cummax()
     drawdown = df["equity"] / running_peak - 1
     max_drawdown = drawdown.min() * 100
 
+    # Sharpe: средняя дневная доходность / её стандартное отклонение,
+    # умноженное на корень из 252 для пересчёта к годовому масштабу.
     daily_returns = df["strategy_return"].dropna()
     volatility = daily_returns.std(ddof=1)
     sharpe = (
@@ -121,28 +134,41 @@ def show_results(df):
     )
     trade_count = int(df["trade_count"].sum())
 
-    print(f"Инструмент: {TICKER}")
-    print(f"Количество дневных свечей: {len(df)}")
-    print(f"Начало периода: {df.index[0].date()}")
-    print(f"Конец периода: {df.index[-1].date()}")
-    print(f"Итоговая доходность: {total_return:.2f}%")
-    print(f"Sharpe (годовой, без безрисковой ставки): {sharpe:.2f}")
-    print(f"Максимальная просадка: {max_drawdown:.2f}%")
-    print(f"Количество сделок (входов в позицию): {trade_count}")
+    # Создаём две панели: кривая капитала и сводка результатов.
+    figure, (ax_chart, ax_stats) = plt.subplots(
+        1, 2, figsize=(13, 6), gridspec_kw={"width_ratios": [3, 1]}
+    )
+    ax_chart.plot(df.index, df["equity"], label="Стратегия")
+    ax_chart.set_title("Бэктест стратегии SMA")
+    ax_chart.set_xlabel("Дата")
+    ax_chart.set_ylabel("Условный капитал")
+    ax_chart.legend()
+    ax_chart.grid(True)
 
-    plt.figure(figsize=(12, 6))
-    plt.plot(df.index, df["equity"], label="Стратегия")
-    plt.title("Бэктест стратегии SMA")
-    plt.xlabel("Дата")
-    plt.ylabel("Условный капитал")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig("equity_curve.png")
+    # Текстовая сводка размещается непосредственно в правой панели окна.
+    ax_stats.axis("off")
+    stats = (
+        f"Инструмент: {TICKER}\n\n"
+        f"Дневных свечей: {len(df)}\n"
+        f"Начало периода: {df.index[0].date()}\n"
+        f"Конец периода: {df.index[-1].date()}\n\n"
+        f"Доходность: {total_return:.2f}%\n"
+        f"Sharpe годовой: {sharpe:.2f}\n"
+        f"Макс. просадка: {max_drawdown:.2f}%\n"
+        f"Сделок: {trade_count}"
+    )
+    ax_stats.text(
+        0.03, 0.97, stats, transform=ax_stats.transAxes,
+        va="top", ha="left", fontsize=11, linespacing=1.5
+    )
+
+    figure.tight_layout()
+    figure.savefig("equity_curve.png")
     plt.show()
 
 
 def main():
+    # Полный цикл: загрузка котировок → бэктест → метрики и график.
     prices = load_prices()
     results = run_backtest(prices)
     show_results(results)
