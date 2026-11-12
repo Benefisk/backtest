@@ -2,13 +2,16 @@
 # matplotlib строит график капитала.
 import requests
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 # Параметры эксперимента: тикер, длина SMA, комиссия за изменение позиции
 # и число торговых дней в году для годового коэффициента Sharpe.
 TICKER = "SBER"
 SMA_PERIOD = 50
-COMMISSION = 0.0005  # 0,05% при изменении позиции
+COMMISSION = 0.0005  # Комиссия на каждую сторону сделки: 0,05%
+SLIPPAGE = 0.0003  # Проскальзывание на каждую сторону: 0,03%
+RISK_FREE_RATE = 0.05  # Годовая безрисковая ставка для Sharpe
 TRADING_DAYS_PER_YEAR = 252
 
 
@@ -34,7 +37,7 @@ def load_prices():
             },
             timeout=30,
         )
-        # Прерываем работу с понятной HTTP-ошибкой, если запрос не удался.
+        # Прерываем работу с понятной HTTP-ошибкой (404, 500 и т.п.), если запрос не удался.
         response.raise_for_status()
 
         candles = response.json()["candles"]
@@ -62,7 +65,7 @@ def load_prices():
     # Приводим дату к типу datetime и используем её как индекс таблицы.
     df["begin"] = pd.to_datetime(df["begin"])
     df = df.set_index("begin")
-    df = df[["open", "close", "volume"]].copy()
+    df = df[["open", "close", "high", "low", "value", "volume"]].copy()
 
     # Убираем дни без торгов, пропуски и дубли; сортируем хронологически.
     df = df[df["volume"] > 0]
@@ -103,7 +106,7 @@ def run_backtest(df):
 
     df["strategy_return"] = (
         df["position"] * df["market_return"]
-        - df["trades"] * COMMISSION
+        - df["trades"] * (COMMISSION + SLIPPAGE)
     )
 
     # Последовательно перемножаем дневные доходности, начиная с капитала 1.
@@ -128,17 +131,29 @@ def show_results(df):
     daily_returns = df["strategy_return"].dropna()
     volatility = daily_returns.std(ddof=1)
     sharpe = (
-        daily_returns.mean() / volatility * (TRADING_DAYS_PER_YEAR ** 0.5)
+        (daily_returns.mean() - RISK_FREE_RATE / TRADING_DAYS_PER_YEAR)
+        / volatility * (TRADING_DAYS_PER_YEAR ** 0.5)
         if len(daily_returns) > 1 and volatility > 0
         else 0.0
     )
     trade_count = int(df["trade_count"].sum())
+
+    # Годовая доходность и дополнительные метрики качества.
+    calendar_days = (df.index[-1] - df.index[0]).days
+    annual_return = (
+        (1 + total_return / 100) ** (365 / calendar_days) - 1
+        if calendar_days > 0 and total_return > -100
+        else 0.0
+    )
+    calmar = annual_return / abs(drawdown.min()) if drawdown.min() < 0 else 0.0
 
     # Создаём две панели: кривая капитала и сводка результатов.
     figure, (ax_chart, ax_stats) = plt.subplots(
         1, 2, figsize=(13, 6), gridspec_kw={"width_ratios": [3, 1]}
     )
     ax_chart.plot(df.index, df["equity"], label="Стратегия")
+    buy_hold = df["close"] / df["close"].iloc[0]
+    ax_chart.plot(df.index, buy_hold, label="Купи и держи", alpha=0.65)
     ax_chart.set_title("Бэктест стратегии SMA")
     ax_chart.set_xlabel("Дата")
     ax_chart.set_ylabel("Условный капитал")
@@ -153,9 +168,13 @@ def show_results(df):
         f"Начало периода: {df.index[0].date()}\n"
         f"Конец периода: {df.index[-1].date()}\n\n"
         f"Доходность: {total_return:.2f}%\n"
+        f"Годовая доходность: {annual_return * 100:.2f}%\n"
         f"Sharpe годовой: {sharpe:.2f}\n"
         f"Макс. просадка: {max_drawdown:.2f}%\n"
-        f"Сделок: {trade_count}"
+        f"Calmar: {calmar:.2f}\n"
+        f"Сделок (входов): {trade_count}\n"
+        f"Комиссия: {COMMISSION * 100:.3f}% + проскальзывание "
+        f"{SLIPPAGE * 100:.3f}% на сторону"
     )
     ax_stats.text(
         0.03, 0.97, stats, transform=ax_stats.transAxes,
