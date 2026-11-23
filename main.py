@@ -1,22 +1,30 @@
 # requests загружает котировки по HTTP, pandas обрабатывает таблицы,
 # matplotlib строит график капитала.
+from pathlib import Path
+
 import requests
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 
-# Параметры эксперимента: тикер, длина SMA, комиссия за изменение позиции
+# Параметры эксперимента: тикер, начало истории, длина SMA, комиссия
+# и проскальзывание на каждую сторону сделки, безрисковая ставка
 # и число торговых дней в году для годового коэффициента Sharpe.
 TICKER = "SBER"
+FROM_DATE = "2023-01-01"  # Начало загружаемой истории
 SMA_PERIOD = 50
 COMMISSION = 0.0005  # Комиссия на каждую сторону сделки: 0,05%
 SLIPPAGE = 0.0003  # Проскальзывание на каждую сторону: 0,03%
 RISK_FREE_RATE = 0.05  # Годовая безрисковая ставка для Sharpe
 TRADING_DAYS_PER_YEAR = 252
 
+# Кэш котировок в CSV: повторный запуск читает файл вместо сети,
+# поэтому расчёт можно перезапустить с теми же данными.
+# Удалите файл, чтобы скачать историю заново.
+CACHE_FILE = Path(f"data/{TICKER}_daily.csv")
 
-def load_prices():
-    """Загружает дневные свечи MOEX и очищает данные перед расчётами."""
+
+def download_prices():
+    """Скачивает дневные свечи MOEX страницами и сохраняет их в CSV-кэш."""
 
     url = (
         "https://iss.moex.com/iss/engines/stock/"
@@ -31,7 +39,7 @@ def load_prices():
         response = requests.get(
             url,
             params={
-                "from": "2023-01-01",
+                "from": FROM_DATE,
                 "interval": 24,
                 "start": start,
             },
@@ -65,6 +73,22 @@ def load_prices():
     # Приводим дату к типу datetime и используем её как индекс таблицы.
     df["begin"] = pd.to_datetime(df["begin"])
     df = df.set_index("begin")
+
+    # Сырые котировки сохраняем рядом с запуском для воспроизводимости.
+    CACHE_FILE.parent.mkdir(exist_ok=True)
+    df.to_csv(CACHE_FILE)
+
+    return df
+
+
+def load_prices():
+    """Берёт котировки из кэша; при первом запуске скачивает их с MOEX."""
+
+    if CACHE_FILE.exists():
+        df = pd.read_csv(CACHE_FILE, index_col=0, parse_dates=True)
+    else:
+        df = download_prices()
+
     df = df[["open", "close", "high", "low", "value", "volume"]].copy()
 
     # Убираем дни без торгов, пропуски и дубли; сортируем хронологически.
@@ -115,6 +139,38 @@ def run_backtest(df):
     return df
 
 
+def build_trade_log(df):
+    """Журнал сделок: даты входа и выхода и результат каждой сделки."""
+
+    log = []
+    entry_price = None
+    entry_date = None
+
+    for date, row in df.iterrows():
+        if row["position_change"] == 1:
+            entry_price = row["close"]
+            entry_date = date
+        elif row["position_change"] == -1 and entry_price is not None:
+            # Из закрытой сделки вычитаем издержки за вход и за выход.
+            result = row["close"] / entry_price - 1 - 2 * (COMMISSION + SLIPPAGE)
+            log.append(
+                {"Вход": entry_date.date(), "Выход": date.date(),
+                 "Результат, %": result * 100}
+            )
+            entry_price = None
+
+    # Позиция, открытая на последний день, оценивается по последней цене;
+    # издержки списаны только за вход.
+    if entry_price is not None:
+        result = df["close"].iloc[-1] / entry_price - 1 - (COMMISSION + SLIPPAGE)
+        log.append(
+            {"Вход": entry_date.date(), "Выход": None,
+             "Результат, %": result * 100}
+        )
+
+    return pd.DataFrame(log)
+
+
 def show_results(df):
     """Показываем метрики в отдельной панели рядом с графиком."""
 
@@ -147,13 +203,33 @@ def show_results(df):
     )
     calmar = annual_return / abs(drawdown.min()) if drawdown.min() < 0 else 0.0
 
+    # Ориентир «купи и держи» на тех же датах и ценах.
+    buy_hold = df["close"] / df["close"].iloc[0]
+    bh_return = (buy_hold.iloc[-1] - 1) * 100
+    bh_drawdown = (buy_hold / buy_hold.cummax() - 1).min() * 100
+
+    # Сводка по сделкам из журнала: доля прибыльных и profit factor.
+    log = build_trade_log(df)
+    if log.empty:
+        wins_count, win_rate, profit_factor = 0, 0.0, 0.0
+    else:
+        wins = log["Результат, %"] > 0
+        wins_count = int(wins.sum())
+        win_rate = wins.mean() * 100
+        gross_profit = log.loc[wins, "Результат, %"].sum()
+        gross_loss = log.loc[~wins, "Результат, %"].sum()
+        profit_factor = gross_profit / abs(gross_loss) if gross_loss < 0 else float("inf")
+
+    # Журнал печатаем в консоль: на графике он не поместится.
+    print("\nЖурнал сделок:")
+    print(log.to_string(index=False))
+
     # Создаём две панели: кривая капитала и сводка результатов.
     figure, (ax_chart, ax_stats) = plt.subplots(
-        1, 2, figsize=(13, 6), gridspec_kw={"width_ratios": [3, 1]}
+        1, 2, figsize=(13, 6), gridspec_kw={"width_ratios": [5, 1]}
     )
     ax_chart.plot(df.index, df["equity"], label="Стратегия")
-    buy_hold = df["close"] / df["close"].iloc[0]
-    ax_chart.plot(df.index, buy_hold, label="Купи и держи", alpha=0.65)
+    ax_chart.plot(df.index, buy_hold, label="В долгую", alpha=0.65)
     ax_chart.set_title("Бэктест стратегии SMA")
     ax_chart.set_xlabel("Дата")
     ax_chart.set_ylabel("Условный капитал")
@@ -171,10 +247,14 @@ def show_results(df):
         f"Годовая доходность: {annual_return * 100:.2f}%\n"
         f"Sharpe годовой: {sharpe:.2f}\n"
         f"Макс. просадка: {max_drawdown:.2f}%\n"
-        f"Calmar: {calmar:.2f}\n"
+        f"Calmar: {calmar:.2f}\n\n"
         f"Сделок (входов): {trade_count}\n"
-        f"Комиссия: {COMMISSION * 100:.3f}% + проскальзывание "
-        f"{SLIPPAGE * 100:.3f}% на сторону"
+        f"Прибыльных: {wins_count} ({win_rate:.0f}%)\n"
+        f"Profit factor: {profit_factor:.2f}\n\n"
+        f"В долгую: доходность {bh_return:.2f}%\n"
+        f"В долгую: просадка {bh_drawdown:.2f}%\n\n"
+        f"Комиссия: {COMMISSION * 100:.3f}% \n(+ проскальзывание "
+        f"{SLIPPAGE * 100:.3f}% на сторону)"
     )
     ax_stats.text(
         0.03, 0.97, stats, transform=ax_stats.transAxes,
